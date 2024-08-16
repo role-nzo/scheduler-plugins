@@ -279,3 +279,15 @@ type SySchedArgs struct {
 	// CR name of the default profile for all system calls
 	DefaultProfileName string
 }
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// LatencyAwareArgs holds arguments used to configure the LatencyAware plugin.
+type LatencyAwareArgs struct {
+	metav1.TypeMeta
+
+	// probeAppLabel is the app label of the proble deployment.
+	ProbeAppLabel string
+	// targetAppLabel is the app label of the target deployment.
+	TargetAppLabel string
+}

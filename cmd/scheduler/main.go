@@ -26,6 +26,7 @@ import (
 
 	"sigs.k8s.io/scheduler-plugins/pkg/capacityscheduling"
 	"sigs.k8s.io/scheduler-plugins/pkg/coscheduling"
+	"sigs.k8s.io/scheduler-plugins/pkg/latencyaware"
 	"sigs.k8s.io/scheduler-plugins/pkg/networkaware/networkoverhead"
 	"sigs.k8s.io/scheduler-plugins/pkg/networkaware/topologicalsort"
 	"sigs.k8s.io/scheduler-plugins/pkg/noderesources"
@@ -58,6 +59,7 @@ func main() {
 		app.WithPlugin(targetloadpacking.Name, targetloadpacking.New),
 		app.WithPlugin(lowriskovercommitment.Name, lowriskovercommitment.New),
 		app.WithPlugin(sysched.Name, sysched.New),
+		app.WithPlugin(latencyaware.Name, latencyaware.New),
 		// Sample plugins below.
 		// app.WithPlugin(crossnodepreemption.Name, crossnodepreemption.New),
 		app.WithPlugin(podstate.Name, podstate.New),

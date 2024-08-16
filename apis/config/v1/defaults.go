@@ -250,3 +250,22 @@ func SetDefaults_SySchedArgs(obj *SySchedArgs) {
 		obj.DefaultProfileName = &DefaultSySchedProfileName
 	}
 }
+
+const (
+	// Defaults for LatencyAware plugin
+	DefaultProbeAppLabel  = "probe-app"
+	DefaultTargetAppLabel = "target-app"
+)
+
+// SetDefaults_LatencyAwareArgs sets the default parameters for the LatencyAware plugin
+func SetDefaults_LatencyAwareArgs(obj *LatencyAwareArgs) {
+	if obj.ProbeAppLabel == nil {
+		temp := DefaultProbeAppLabel
+		obj.ProbeAppLabel = &temp
+	}
+
+	if obj.TargetAppLabel == nil {
+		temp := DefaultTargetAppLabel
+		obj.TargetAppLabel = &temp
+	}
+}

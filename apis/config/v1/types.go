@@ -277,3 +277,15 @@ type SySchedArgs struct {
 	// CR name of the default profile for all system calls
 	DefaultProfileName *string `json:"defaultProfileName,omitempty"`
 }
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// LatencyAwareArgs holds arguments used to configure the LatencyAware plugin.
+type LatencyAwareArgs struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// probeAppLabel is the app label of the probe deployment.
+	ProbeAppLabel *string `json:"probeAppLabel,omitempty"`
+	// targetAppLabel is the app label of the target deployment.
+	TargetAppLabel *string `json:"targetAppLabel,omitempty"`
+}
