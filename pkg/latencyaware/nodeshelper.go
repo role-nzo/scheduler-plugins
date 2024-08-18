@@ -31,6 +31,10 @@ func (vn *VisitedNodes) SetVisitedIfNot(nodeName string) bool {
 func (vn *VisitedNodes) SetVisited(nodeName string) {
 	vn.mu.Lock()
 	defer vn.mu.Unlock()
+	vn.SetVisitedWithoutLock(nodeName)
+}
+
+func (vn *VisitedNodes) SetVisitedWithoutLock(nodeName string) {
 	vn.nodes = append(vn.nodes, nodeName)
 }
 
@@ -70,6 +74,10 @@ func (vn *VisitedNodes) IsVisited(nodeName string) bool {
 func (vn *VisitedNodes) Reset() {
 	vn.mu.Lock()
 	defer vn.mu.Unlock()
+	vn.ResetWithoutLock()
+}
+
+func (vn *VisitedNodes) ResetWithoutLock() {
 	vn.nodes = make([]string, 0)
 }
 

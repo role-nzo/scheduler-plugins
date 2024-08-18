@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
@@ -27,18 +29,38 @@ func (la *LatencyAware) Name() string {
 
 type LatencyAware struct {
 	sync.Mutex
+	cancelTimeout              *func()
 	handle                     framework.Handle
 	informer                   cache.SharedInformer
-	reservedProbeNodes         VisitedNodes //reservedNodes non è funzionante perché i pod target e probe potrebbero essere schedulati sullo stesso nodo
-	reservedTargetNodes        VisitedNodes
-	nodesWithTargetAndNotProbe VisitedNodes
-	nodesWithProbeAndNotTarget VisitedNodes //TODO: se il deployment viene eliminato e questa struttura ha una entry questa non verrà mai eliminata -> è necessario essere in ascolto del descheduling per ripulire la struttura
+	nodesWithProbeAndNotTarget VisitedNodes
 	probeVisitedNodes          VisitedNodes
 }
 
 var _ framework.FilterPlugin = &LatencyAware{}
-var _ framework.ScorePlugin = &LatencyAware{}
 var _ framework.PostBindPlugin = &LatencyAware{}
+var _ framework.ReservePlugin = &LatencyAware{}
+var _ framework.PermitPlugin = &LatencyAware{}
+
+func (la *LatencyAware) getNodeCount() (int, error) {
+	nodes, err := la.handle.ClientSet().CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return 0, err
+	}
+	return len(nodes.Items), nil
+}
+
+func (la *LatencyAware) getPodsByAppLabel(ctx context.Context, label string) (*corev1.PodList, error) {
+	podList, err := la.handle.ClientSet().CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(labels.Set{
+			"app": label,
+		}).String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return podList, nil
+}
 
 // Filter : filter nodes based on pod label
 func (la *LatencyAware) Filter(ctx context.Context,
@@ -46,123 +68,50 @@ func (la *LatencyAware) Filter(ctx context.Context,
 	pod *corev1.Pod,
 	nodeInfo *framework.NodeInfo) *framework.Status {
 
-	la.Lock()
-	defer la.Unlock()
-
-	// Check if the pod is not "probe" or "target"
-	if pod.Labels["app"] != ProbeAppLabel && pod.Labels["app"] != TargetAppLabel {
-		return framework.NewStatus(framework.Success,
-			fmt.Sprintf("Pod %v is not \"probe\" or \"target\"", pod.Name))
-	}
-
-	if data, err := cycleState.Read("ReservedNode"); err == nil {
-		klog.Infof("[LatencyAware] Pod %v already has a reserved node: %v", pod.Name, data.(*ReservedNodeState).nodeName)
-
-		return framework.NewStatus(framework.Unschedulable,
-			fmt.Sprintf("Pod %v already has a reserved node: %v", pod.Name, nodeInfo.Node().Name))
-	}
-
-	// Your code to get the pod "app" label goes here
 	appLabel := pod.Labels["app"]
-	klog.Infof("[LatencyAware] Pod %v has app label: %v (in node %v)\n", pod.Name, appLabel, nodeInfo.Node().Name)
 
-	if appLabel == TargetAppLabel { // Check if the pod is "probe"
-		// Check if the node has currently a "probe" pod
-		/*if la.currentTargetNodes.IsVisited(nodeInfo.Node().Name) {
-			klog.Infof("[LatencyAware] Node %v already has \"target\"", nodeInfo.Node().Name)
+	// If the pod is neither a probe nor a target, it can be scheduled anywhere
+	if appLabel != ProbeAppLabel && appLabel != TargetAppLabel {
+		return framework.NewStatus(framework.Success,
+			fmt.Sprintf("Pod %v can be scheduled in %v", pod.Name, nodeInfo.Node().Name))
+	}
 
-			return framework.NewStatus(framework.Unschedulable,
-				fmt.Sprintf("Node %v is already been visited by a \"probe\" pod", nodeInfo.Node().Name))
-		}*/
+	// Get the number of nodes in the cluster
+	numNodes, err := la.getNodeCount()
+	if err != nil {
+		klog.Errorf("[LatencyAware] Error getting the number of nodes: %v", err)
+		return framework.NewStatus(framework.Unschedulable,
+			fmt.Sprintf("Pod %v cannot be scheduled in %v", pod.Name, nodeInfo.Node().Name))
+	}
 
-		if hasPodWithLabel(nodeInfo.Pods, TargetAppLabel) {
-			klog.Infof("[LatencyAware] Node %v already has \"target\"", nodeInfo.Node().Name)
-
-			return framework.NewStatus(framework.Unschedulable,
-				fmt.Sprintf("Node %v is already been visited by a \"probe\" pod", nodeInfo.Node().Name))
-		}
-
-		if len(la.nodesWithProbeAndNotTarget.nodes) > 0 {
-			klog.Infof("[LatencyAware] There are some nodes with \"probe\" and not \"target\"")
-
-			if !la.nodesWithProbeAndNotTarget.IsVisited(nodeInfo.Node().Name) {
-				klog.Infof("[LatencyAware] Node %v is invalid for \"target\" because other nodes have \"probe\" without \"target\"", nodeInfo.Node().Name)
-
-				return framework.NewStatus(framework.Unschedulable,
-					fmt.Sprintf("Node %v is invalid for \"target\" because other nodes have \"probe\" without \"target\"", nodeInfo.Node().Name))
-			}
-		}
-
-		//problema: nodesWithProbeAndNotTarget funziona solo quando i pod sono già schedulati; in caso siano ancora in pending non funziona
-		//			va calcolata la differenza di reservedTargetNodes e reservedProbeNodes
-
-		if diff := la.reservedProbeNodes.Difference(&la.reservedTargetNodes); len(diff.nodes) > 0 {
-			if !diff.IsVisited(nodeInfo.Node().Name) {
-				klog.Infof("[LatencyAware] Node %v is invalid for \"target\" because there are some reserved nodes for \"probe\" and this is not one of them", nodeInfo.Node().Name)
-
-				return framework.NewStatus(framework.Unschedulable,
-					fmt.Sprintf("Node %v is invalid for \"target\" because other nodes are reserved for \"probe\" and not \"target\"", nodeInfo.Node().Name))
-			}
-		}
-
-		if la.reservedTargetNodes.SetVisitedIfNot(nodeInfo.Node().Name) {
-			klog.Infof("[LatencyAware] Node %v is valid for %v", nodeInfo.Node().Name, pod.Name)
-
-			cycleState.Write("ReservedNode", &ReservedNodeState{
-				nodeName: nodeInfo.Node().Name,
-			})
-
+	// If
+	//  - the pod is a target
+	//  - all the nodes have been visited by the probe or target (no completely free nodes)
+	//  - there are nodes with a probe and not a target
+	// then the pod can be scheduled only in the nodes with a probe and not a target
+	if appLabel == TargetAppLabel && len(la.probeVisitedNodes.nodes) == numNodes && len(la.nodesWithProbeAndNotTarget.nodes) > 0 {
+		if la.nodesWithProbeAndNotTarget.IsVisited(nodeInfo.Node().Name) {
+			klog.Infof("[LatencyAware] Pod %v CAN be scheduled in \"probe\" only node: %v", pod.Name, nodeInfo.Node().Name)
 			return framework.NewStatus(framework.Success,
 				fmt.Sprintf("Pod %v can be scheduled in %v", pod.Name, nodeInfo.Node().Name))
-		}
-	} else if appLabel == ProbeAppLabel { // Check if the pod is "target"
-		// Check if the node is already visited by a "target" pod
-		if la.probeVisitedNodes.IsVisited(nodeInfo.Node().Name) {
-			klog.Infof("[LatencyAware] Node %v already had (has) \"probe\"", nodeInfo.Node().Name)
-
+		} else {
+			klog.Infof("[LatencyAware] Pod %v CANNOT be scheduled in the node %v because there are nodes with only probe", pod.Name, nodeInfo.Node().Name)
 			return framework.NewStatus(framework.Unschedulable,
-				fmt.Sprintf("Node %v is already been visited by a \"target\" pod", nodeInfo.Node().Name))
-		}
-
-		if len(la.nodesWithTargetAndNotProbe.nodes) > 0 {
-			klog.Infof("[LatencyAware] There are some nodes with \"target\" and not \"probe\"")
-
-			if !la.nodesWithTargetAndNotProbe.IsVisited(nodeInfo.Node().Name) {
-				klog.Infof("[LatencyAware] Node %v is invalid for \"probe\" because other nodes have \"target\" without \"probe\"", nodeInfo.Node().Name)
-
-				return framework.NewStatus(framework.Unschedulable,
-					fmt.Sprintf("Node %v is invalid for \"probe\" because other nodes have \"target\" without \"probe\"", nodeInfo.Node().Name))
-			}
-		}
-
-		if diff := la.reservedTargetNodes.Difference(&la.reservedProbeNodes); len(diff.nodes) > 0 {
-			if !diff.IsVisited(nodeInfo.Node().Name) {
-				klog.Infof("[LatencyAware] Node %v is invalid for \"probe\" because there are some reserved nodes for \"target\" and this is not one of them", nodeInfo.Node().Name)
-
-				return framework.NewStatus(framework.Unschedulable,
-					fmt.Sprintf("Node %v is invalid for \"target\" because other nodes are reserved for \"target\" and not \"probe\"", nodeInfo.Node().Name))
-			}
-		}
-
-		if la.reservedProbeNodes.SetVisitedIfNot(nodeInfo.Node().Name) {
-			klog.Infof("[LatencyAware] Node %v is valid for %v", nodeInfo.Node().Name, pod.Name)
-
-			cycleState.Write("ReservedNode", &ReservedNodeState{
-				nodeName: nodeInfo.Node().Name,
-			})
-
-			return framework.NewStatus(framework.Success,
-				fmt.Sprintf("Pod %v can be scheduled in %v", pod.Name, nodeInfo.Node().Name))
+				fmt.Sprintf("Pod %v cannot be scheduled in %v", pod.Name, nodeInfo.Node().Name))
 		}
 	}
 
-	//PROBLEMA: due diversi nodi per lo stesso pod potrebbero arrivare contemporaneamente qui ed essere occupati entrambi
-	//  	  bisogna fare in modo che solo uno dei due possa riservare il nodo (lock dell'intero filter)
+	// If the node is not yet visited by the probe pod
+	if !la.probeVisitedNodes.IsVisited(nodeInfo.Node().Name) {
+		klog.Infof("[LatencyAware] Pod %v CAN be scheduled in: %v", pod.Name, nodeInfo.Node().Name)
+		return framework.NewStatus(framework.Success,
+			fmt.Sprintf("Pod %v can be scheduled in %v", pod.Name, nodeInfo.Node().Name))
+	}
 
-	klog.Infof("[LatencyAware] Node %v is ALREADY RESERVED for %v", nodeInfo.Node().Name, appLabel)
-
+	// If the node is already visited by the probe pod it cannot be scheduled
+	klog.Infof("[LatencyAware] Pod %v CANNOT be scheduled in: %v", pod.Name, nodeInfo.Node().Name)
 	return framework.NewStatus(framework.Unschedulable,
-		fmt.Sprintf("Node %v is ALREADY RESERVED for %v", nodeInfo.Node().Name, appLabel))
+		fmt.Sprintf("Pod %v cannot be scheduled in %v", pod.Name, nodeInfo.Node().Name))
 }
 
 func hasPodWithLabel(pods interface{}, label string) bool {
@@ -190,146 +139,265 @@ func hasPodWithLabel(pods interface{}, label string) bool {
 	return false
 }
 
-// ScoreExtensions : an interface for Score extended functionality
-func (la *LatencyAware) ScoreExtensions() framework.ScoreExtensions {
-	return la
+// Reserve: reserve the node chosen for the pod
+// If the node is already visited, the pod cannot be scheduled (but this should never happen, see the body function)
+// If this function (or any subsequent plugin in this or subsequent stages) returns an error, the node will be unvisited in the "Unreserve" function
+func (la *LatencyAware) Reserve(ctx context.Context, state *framework.CycleState, pod *corev1.Pod, nodeName string) *framework.Status {
+	appLabel := pod.Labels["app"]
+
+	klog.Infof("[LatencyAware] RESERVE: Pod %v visited %v", pod.Name, nodeName)
+
+	// If the pod is neither a probe nor a target, it can be scheduled anywhere
+	if appLabel != ProbeAppLabel && appLabel != TargetAppLabel {
+		return framework.NewStatus(framework.Success,
+			fmt.Sprintf("Pod %v can be scheduled in %v", pod.Name, nodeName))
+	}
+
+	// If the node is not yet visited by the pod
+	if la.probeVisitedNodes.SetVisitedIfNot(nodeName) {
+		klog.Infof("[LatencyAware] Pod %v visited %v", pod.Name, nodeName)
+
+		// If it's a probe only pod, the node is inserted in the list of nodes with a probe and not a target
+		if appLabel == ProbeAppLabel {
+			klog.Infof("[LatencyAware] Probe pod %v reserved %v", pod.Name, nodeName)
+			la.nodesWithProbeAndNotTarget.SetVisited(nodeName)
+		}
+
+		return framework.NewStatus(framework.Success)
+	}
+
+	// If the node is already visited by the pod
+	//    this happens when trying to schedule a target pod on a node already visited by a probe pod
+	return framework.NewStatus(framework.Success)
+
+	// NOTE: this could be executed when scheduling a target over a node already visited by a probe
+
+	// Toeretically this should never be executed
+	//	the pod scheduling scheduling cycle is sequential and not concurrent
+	//	only the filter plugin is executed concurrently for the same pod
+	//  the nodes that are already visited never reach the permit plugin again
+	//
+	//  POD 1                                        POD 2
+	// 	----------------------                       ----------------------
+	//  Filter N1 -\               					 Filter N1 -\
+	//  Filter N2 -- Reserve NX -- PostBind NX		 Filter N2 -- Reserve NY -- PostBind NY
+	//  Filter N3 -/							     Filter N3 -/
+	//
+	//klog.Infof("[LatencyAware] Node %v IS ALREADY VISITED (pod %v)", nodeName, pod.Name)
+	//return framework.NewStatus(framework.Unschedulable)
 }
 
-func (no *LatencyAware) NormalizeScore(ctx context.Context,
-	state *framework.CycleState,
-	pod *corev1.Pod,
-	scores framework.NodeScoreList) *framework.Status {
-	return nil
+// Unreserve: executed if the "Reserve" or any subsequent plugin fails
+// This is important because the state of the plugin is updated freeing the reserved node for the next scheduling cycle
+// If this function is not implemented the node will remain reserved even if the scheduling cycle fails
+func (la *LatencyAware) Unreserve(ctx context.Context, state *framework.CycleState, pod *corev1.Pod, nodeName string) {
+	appLabel := pod.Labels["app"]
+
+	if appLabel != ProbeAppLabel && appLabel != TargetAppLabel {
+		return
+	}
+
+	klog.Infof("[LatencyAware] UNRESERVE: Pod %v visited %v", pod.Name, nodeName)
+
+	la.probeVisitedNodes.SetUnvisited(nodeName)
+
+	if appLabel == ProbeAppLabel {
+		la.nodesWithProbeAndNotTarget.SetUnvisited(nodeName)
+	}
 }
 
-// Score : evaluate score for a node
-func (la *LatencyAware) Score(ctx context.Context,
-	cycleState *framework.CycleState,
-	pod *corev1.Pod,
-	nodeName string) (int64, *framework.Status) {
+// Permit: permit the scheduling of the pod on the node (useless for now)
+func (la *LatencyAware) Permit(ctx context.Context, state *framework.CycleState, pod *corev1.Pod, nodeName string) (*framework.Status, time.Duration) {
 
-	score := int64(0)
-	klog.Infof("[LatencyAware] Score for node %s is %d", nodeName, score)
+	appLabel := pod.Labels["app"]
 
-	return DefaultScore, nil
+	klog.Infof("[LatencyAware] PERMIT: Pod %v visited %v", pod.Name, nodeName)
+
+	// If the pod is neither a probe nor a target, it can be scheduled anywhere
+	if appLabel != ProbeAppLabel && appLabel != TargetAppLabel {
+		return framework.NewStatus(framework.Success,
+			fmt.Sprintf("Pod %v can be scheduled in %v", pod.Name, nodeName)), 0
+	}
+
+	return framework.NewStatus(framework.Success,
+		fmt.Sprintf("Pod %v can be scheduled in %v", pod.Name, nodeName)), 0
+
+	// random unschedulable: for testing
+	/*if rand.Intn(2) == 0 {
+		klog.Infof("[LatencyAware] Pod %v scheduled in: %v", pod.Name, nodeName)
+		return framework.NewStatus(framework.Success), 0
+	} else {
+		klog.Infof("[LatencyAware] KILLING: Pod %v visited %v", pod.Name, nodeName)
+		klog.Infof("[LatencyAware] Pod %v not scheduled in: %v", pod.Name, nodeName)
+		return framework.NewStatus(framework.Unschedulable), 0
+	}*/
 }
-
-// ScoreExtensions : an interface for Score extended functionality
-/*func (la *LatencyAware) ScoreExtensions() framework {
-	return la
-}*/
 
 func (la *LatencyAware) PostBind(ctx context.Context, state *framework.CycleState, pod *corev1.Pod, nodeName string) {
-	klog.Infof("[LatencyAware] PostBind: %v\n", pod.Labels["app"])
+	klog.Infof("[LatencyAware] Pod %v has been scheduled in: %v (DT: %v)", pod.Name, nodeName, pod.DeletionTimestamp)
 
-	// Check if the pod is not "probe" or "target"
-	if pod.Labels["app"] != ProbeAppLabel && pod.Labels["app"] != TargetAppLabel {
-		return
-	}
-
-	// Get the Kubernetes client from the framework handle
-	client := la.handle.ClientSet()
-
-	// Fetch the list of nodes
-	nodes, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
-
-	// Fetch the list of pods on the same node
-	pods, err := client.CoreV1().Pods(corev1.NamespaceAll).List(ctx, metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
-	})
-
-	if err != nil {
-		// Handle the error appropriately
-		klog.Errorf("[LatencyAware] Error listing pods on node %s: %v", nodeName, err)
-		return
-	}
-
-	// Your code to get the pod "app" label goes here
 	appLabel := pod.Labels["app"]
-	klog.Infof("[LatencyAware] Pod %v has been scheduled in: %v\n", pod.Name, nodeName)
 
-	if appLabel == TargetAppLabel { // Check if the pod is "probe"
-		// Check if the node has currently a "probe" pod -> if not inserts the node in the set of nodes with target and not probe
-		if !hasPodWithLabel(pods, ProbeAppLabel) {
-			la.nodesWithTargetAndNotProbe.SetVisited(nodeName)
-		} else {
-			la.nodesWithProbeAndNotTarget.SetUnvisited(nodeName)
-		}
+	// If the pod is a target
+	if appLabel == TargetAppLabel {
+		// If the node was visited by a probe pod and not a target pod
+		if la.nodesWithProbeAndNotTarget.IsVisited(nodeName) {
+			// Find and deschedule the ProbeAppLabel pod on the same node
 
-		if la.reservedTargetNodes.SetUnvisited(nodeName) {
-			klog.Infof("[LatencyAware] Node %v is not reserved anymore", nodeName)
-		}
-	} else if appLabel == ProbeAppLabel { // Check if the pod is "target"
-		// Check if the node has currently a "target" pod -> if not inserts the node in the set of nodes with probe and not target
-		if !hasPodWithLabel(pods, TargetAppLabel) {
-			la.nodesWithProbeAndNotTarget.SetVisited(nodeName)
-		} else {
-			la.nodesWithTargetAndNotProbe.SetUnvisited(nodeName)
-		}
+			// Get the list of pods with the probe label (containing only probe)
+			podList, err := la.handle.ClientSet().CoreV1().Pods(pod.Namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: labels.SelectorFromSet(labels.Set{
+					"app": ProbeAppLabel,
+				}).String(),
+			})
+			if err != nil {
+				klog.Errorf("[LatencyAware] Error listing pods: %v", err)
+				return
+			}
 
-		// Set the node as visited by a "probe" pod
-		la.probeVisitedNodes.SetVisited(nodeName)
-
-		if len(la.probeVisitedNodes.nodes) == len(nodes.Items) {
-			la.probeVisitedNodes.Reset()
-		}
-
-		if la.reservedProbeNodes.SetUnvisited(nodeName) {
-			klog.Infof("[LatencyAware] Node %v is not reserved anymore", nodeName)
+			// For each pod with the probe label
+			for _, p := range podList.Items {
+				// If the pod is scheduled on the same node
+				if p.Spec.NodeName == nodeName {
+					klog.Infof("[LatencyAware] Descheduling ProbeAppLabel pod %v on node %v", p.Name, nodeName)
+					// Deschedule the probe pod on the same node
+					err := la.handle.ClientSet().CoreV1().Pods(p.Namespace).Delete(context.TODO(), p.Name, metav1.DeleteOptions{})
+					if err != nil {
+						klog.Errorf("[LatencyAware] Error deleting pod: %v", err)
+					}
+				}
+			}
 		}
 	}
 
-	klog.Infof("[LatencyAware] ----------------------- reservedProbeNodes:         %v", la.reservedProbeNodes.Join())
-	klog.Infof("[LatencyAware] ----------------------- reservedTargetNodes:        %v", la.reservedTargetNodes.Join())
-	klog.Infof("[LatencyAware] ----------------------- nodesWithTargetAndNotProbe: %v", la.nodesWithTargetAndNotProbe.Join())
-	klog.Infof("[LatencyAware] ----------------------- nodesWithProbeAndNotTarget: %v", la.nodesWithProbeAndNotTarget.Join())
-	klog.Infof("[LatencyAware] ----------------------- probeVisitedNodes:          %v", la.probeVisitedNodes.Join())
+	// Start the timeout to reset the visited nodes
+	la.startTimeout(ctx)
+}
+
+// handlePodDelete: handle the deletion of a pod (for now only probe pods)
+func (la *LatencyAware) handlePodDelete(obj interface{}, ctx context.Context) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		fmt.Println("Error casting to pod")
+		return
+	}
+
+	appLabel := pod.Labels["app"]
+
+	// If the pod is probe
+	if appLabel == ProbeAppLabel {
+		// If the node is visited by ONLY the probe pod, remove it from the list
+		if la.nodesWithProbeAndNotTarget.SetUnvisited(pod.Spec.NodeName) {
+			klog.Infof("[LatencyAware] Probe pod %v left %v", pod.Name, pod.Spec.NodeName)
+
+			// Start the timeout to reset the visited nodes
+			la.startTimeout(ctx)
+		}
+	} else if appLabel == TargetAppLabel {
+		targetPodList, err := la.getPodsByAppLabel(ctx, TargetAppLabel)
+		if err != nil {
+			klog.Errorf("[LatencyAware] Error listing target pods: %v", err)
+			return
+		}
+
+		klog.Infof("[LatencyAware] Target pod in deletion: %v", pod.Name)
+
+		inDeletion := 0
+		for _, pod := range targetPodList.Items {
+			if pod.DeletionTimestamp != nil {
+				inDeletion++
+				klog.Infof("[LatencyAware] Pod %v has a deletion timestamp: %v (state %v)", pod.Name, pod.DeletionTimestamp, pod.Status.Phase)
+			} else {
+				klog.Infof("[LatencyAware] Pod %v has NOT a deletion timestamp: %v (state %v)", pod.Name, pod.DeletionTimestamp, pod.Status.Phase)
+			}
+		}
+
+		// If all the pods are in deletion, reset the visited nodes
+		//	this happens when the deployment is deleted
+		//	it's robust even if the deletion happens sequentially
+		//
+		// parallel example:
+		// DEL POD 1 -\
+		// DEL POD 2 -- 3 == inDeletion == len(targetPodList.Items) == 3 -- true
+		// DEL POD 3 -/
+		//
+		// sequential example:
+		// DEL POD 1 -- 1 == inDeletion != len(targetPodList.Items) == 3 -- false,
+		//     after DEL POD 2 -- 1 == inDeletion != len(targetPodList.Items) == 2 -- false,
+		//         after DEL POD 3 -- 1 == inDeletion == len(targetPodList.Items) == 1 -- true
+		//
+		if len(targetPodList.Items) == inDeletion {
+			klog.Infof("[LatencyAware] Resetting visited nodes because there are no more target pods")
+
+			if la.cancelTimeout != nil {
+				klog.Infof("[LatencyAware] A reset timer was set. Cancelling it...")
+				(*la.cancelTimeout)()
+			}
+
+			la.resetAndFillStructs(ctx)
+		}
+	}
+
+}
+
+// startTimeout: start the timeout to reset the visited nodes
+// If all the nodes have been visited by the probe+target pods and there are no nodes with a probe and not a target
+func (la *LatencyAware) startTimeout(ctx context.Context) error {
+	// Get the number of nodes in the cluster
+	numNodes, err := la.getNodeCount()
+	if err != nil {
+		klog.Errorf("[LatencyAware] Error getting the number of nodes: %v", err)
+		return err
+	}
+
+	// stall condition: no actions can be taken anymore by the plugin
+	// 		- all the nodes have been visited by the probe+target pods
+	//		- there are no nodes with a probe and not a target
+	if len(la.probeVisitedNodes.nodes) == numNodes && len(la.nodesWithProbeAndNotTarget.nodes) == 0 {
+		klog.Infof("[LatencyAware] Timer set.")
+
+		if la.cancelTimeout != nil {
+			(*la.cancelTimeout)()
+			la.cancelTimeout = nil
+		}
+
+		cancelContext, cancel := context.WithCancel(context.Background())
+		cleanup := func() {
+			cancel()
+			klog.Infof("[LatencyAware] Timer cancelled.")
+			la.cancelTimeout = nil
+		}
+		la.cancelTimeout = &cleanup
+
+		go func() {
+			time.Sleep(30 * time.Second)
+
+			select {
+			case <-cancelContext.Done():
+				klog.Infof("[LatencyAware] Reset goroutine cancelled.")
+				return
+			default:
+				if la.cancelTimeout == &cleanup {
+					la.cancelTimeout = nil
+				}
+
+				klog.Infof("[LatencyAware] Resetting visited nodes...")
+
+				la.resetAndFillStructs(ctx)
+
+				klog.Infof("[LatencyAware] Resetting visited nodes completed: \n\t\tprobeVisitedNodes:\t%v\n\t\tnodesWithProbeAndNotTarget:\t%v", la.probeVisitedNodes.Join(), la.nodesWithProbeAndNotTarget.Join())
+			}
+		}()
+	}
+
+	return nil
 }
 
 var ProbeAppLabel string
 var TargetAppLabel string
 
-/*type VisitedNodes struct {
-	probeNodes  map[string]bool
-	targetNodes map[string]bool
-}
-
-func (la *LatencyAware) Schedule(ctx context.Context, state *framework.CycleState, pod *corev1.Pod, nodeName string) *framework.Status {
-	visited := state.GetVisitedNodes()
-	if visited == nil {
-		visited = &VisitedNodes{
-			probeNodes:  make(map[string]bool),
-			targetNodes: make(map[string]bool),
-		}
-		state.SetVisitedNodes(visited)
-	}
-
-	if pod.Labels[ProbeAppLabel] != "" {
-		visited.probeNodes[nodeName] = true
-	} else if pod.Labels[TargetAppLabel] != "" {
-		visited.targetNodes[nodeName] = true
-	}
-
-	return nil
-}*/
-
-// OnNodeAdd is called when a new node is added
-func (la *LatencyAware) OnNodeAdd(node *corev1.Node) {
-	fmt.Printf("Node added: %s\n", node.Name)
-}
-
-// OnNodeUpdate is called when a node is updated
-func (la *LatencyAware) OnNodeUpdate(oldNode, newNode *corev1.Node) {
-	fmt.Printf("Node updated: %s\n", newNode.Name)
-}
-
-// OnNodeDelete is called when a node is deleted
-func (la *LatencyAware) OnNodeDelete(node *corev1.Node) {
-	fmt.Printf("Node deleted: %s\n", node.Name)
-}
-
 // New initializes a new plugin and returns it.
-func New(_ context.Context, obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
+func New(ctx context.Context, obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
 	var args, ok = obj.(*pluginConfig.LatencyAwareArgs)
 	if !ok {
 		return nil, fmt.Errorf("[LatencyAwareArgs] want args to be of type LatencyAwareArgs, got %T", obj)
@@ -340,20 +408,9 @@ func New(_ context.Context, obj runtime.Object, h framework.Handle) (framework.P
 	TargetAppLabel = args.TargetAppLabel
 
 	la := &LatencyAware{
-		handle: h,
-		reservedProbeNodes: VisitedNodes{
-			mu:    sync.Mutex{},
-			nodes: make([]string, 0),
-		},
-		reservedTargetNodes: VisitedNodes{
-			mu:    sync.Mutex{},
-			nodes: make([]string, 0),
-		},
+		handle:        h,
+		cancelTimeout: nil,
 		nodesWithProbeAndNotTarget: VisitedNodes{
-			mu:    sync.Mutex{},
-			nodes: make([]string, 0),
-		},
-		nodesWithTargetAndNotProbe: VisitedNodes{
 			mu:    sync.Mutex{},
 			nodes: make([]string, 0),
 		},
@@ -363,33 +420,71 @@ func New(_ context.Context, obj runtime.Object, h framework.Handle) (framework.P
 		},
 	}
 
+	// To reset the state of the plugin
+	la.resetAndFillStructs(ctx)
+
 	la.informer = h.SharedInformerFactory().Core().V1().Pods().Informer()
 
 	la.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		DeleteFunc: func(obj interface{}) {
-			pod, ok := obj.(*corev1.Pod)
-			if !ok {
-				fmt.Println("Error casting to pod")
-				return
-			}
-
-			appLabel := pod.Labels["app"]
-
-			if appLabel == ProbeAppLabel {
-				if la.nodesWithProbeAndNotTarget.SetUnvisited(pod.Spec.NodeName) {
-					klog.Infof("[LatencyAware] Node %v had only \"probe\": deleted %v\n", pod.Spec.NodeName, pod.Name)
-				}
-			} else if appLabel == TargetAppLabel {
-				if la.nodesWithTargetAndNotProbe.SetUnvisited(pod.Spec.NodeName) {
-					klog.Infof("[LatencyAware] Node %v had only \"target\": deleted %v\n", pod.Spec.NodeName, pod.Name)
-				}
-			}
+			la.handlePodDelete(obj, ctx)
 		},
 	})
 
 	go la.informer.Run(context.Background().Done())
 
 	return la, nil
+}
+
+// Reset and fill the structs with the nodes that have a probe or target pod
+func (la *LatencyAware) resetAndFillStructs(ctx context.Context) error {
+	// Get the list of pods with the target label (containing target and probe)
+	targetPodList, errTarget := la.getPodsByAppLabel(ctx, TargetAppLabel)
+	if errTarget != nil {
+		klog.Errorf("[LatencyAware] Error listing target pods: %v", errTarget)
+		return errTarget
+	}
+
+	// Get the list of pods with the probe label (containing only probe)
+	probePodList, errProbe := la.getPodsByAppLabel(ctx, ProbeAppLabel)
+	if errProbe != nil {
+		klog.Errorf("[LatencyAware] Error listing probe pods: %v", errProbe)
+		return errProbe
+	}
+
+	// Lock the structs
+	la.probeVisitedNodes.mu.Lock()
+	la.nodesWithProbeAndNotTarget.mu.Lock()
+	defer la.probeVisitedNodes.mu.Unlock()
+	defer la.nodesWithProbeAndNotTarget.mu.Unlock()
+
+	// Reset the structs
+	la.probeVisitedNodes.ResetWithoutLock()
+	la.nodesWithProbeAndNotTarget.ResetWithoutLock()
+
+	// Fill probeVisitedNodes with the nodes that have a target pod
+	for _, pod := range targetPodList.Items {
+		// If NodeName is not empty (the pod is scheduled)
+		if pod.Spec.NodeName != "" {
+			if pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning {
+				klog.Infof("[LatencyAware] Resetting probeVisitedNodes: %v with pod %v", pod.Spec.NodeName, pod.Name)
+				la.probeVisitedNodes.SetVisitedWithoutLock(pod.Spec.NodeName)
+			}
+		}
+	}
+
+	// Fill nodesWithProbeAndNotTarget with the nodes that have a probe pod
+	for _, pod := range probePodList.Items {
+		// If NodeName is not empty (the pod is scheduled)
+		if pod.Spec.NodeName != "" {
+			if pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning {
+				klog.Infof("[LatencyAware] Resetting nodesWithProbeAndNotTarget: %v with pod %v", pod.Spec.NodeName, pod.Name)
+				la.nodesWithProbeAndNotTarget.SetVisitedWithoutLock(pod.Spec.NodeName)
+			}
+		}
+	}
+
+	return nil
 }
 
 /*
