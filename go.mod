@@ -7,7 +7,6 @@ require (
 	github.com/diktyo-io/appgroup-api v1.0.1-alpha
 	github.com/diktyo-io/networktopology-api v1.0.1-alpha
 	github.com/dustin/go-humanize v1.0.1
-	github.com/eclipse/paho.mqtt.golang v1.5.0
 	github.com/go-logr/logr v1.3.0
 	github.com/google/go-cmp v0.6.0
 	github.com/k8stopologyawareschedwg/noderesourcetopology-api v0.1.2
