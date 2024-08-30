@@ -315,6 +315,10 @@ func (la *LatencyAware) handlePodDelete(obj interface{}, ctx context.Context) {
 
 	appLabel := pod.Labels["app"]
 
+	if appLabel != ProbeAppLabel && appLabel != TargetAppLabel {
+		return
+	}
+
 	// If the pod is probe
 	if appLabel == ProbeAppLabel {
 		// If the node is visited by ONLY the probe pod, remove it from the list
@@ -497,7 +501,7 @@ func (la *LatencyAware) resetAndFillStructs(ctx context.Context) error {
 	for _, pod := range targetPodList.Items {
 		// If NodeName is not empty (the pod is scheduled)
 		if pod.Spec.NodeName != "" {
-			if pod.DeletionTimestamp != nil && (pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning) {
+			if pod.DeletionTimestamp == nil && (pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning) {
 				klog.Infof("[LatencyAware] Resetting probeVisitedNodes: %v with pod %v", pod.Spec.NodeName, pod.Name)
 				la.probeVisitedNodes.SetVisitedWithoutLock(pod.Spec.NodeName)
 			}
@@ -508,7 +512,7 @@ func (la *LatencyAware) resetAndFillStructs(ctx context.Context) error {
 	for _, pod := range probePodList.Items {
 		// If NodeName is not empty (the pod is scheduled)
 		if pod.Spec.NodeName != "" {
-			if pod.DeletionTimestamp != nil && (pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning) {
+			if pod.DeletionTimestamp == nil && (pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning) {
 				klog.Infof("[LatencyAware] Resetting nodesWithProbeAndNotTarget: %v with pod %v", pod.Spec.NodeName, pod.Name)
 				la.nodesWithProbeAndNotTarget.SetVisitedWithoutLock(pod.Spec.NodeName)
 				la.probeVisitedNodes.SetVisitedWithoutLock(pod.Spec.NodeName)
