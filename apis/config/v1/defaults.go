@@ -253,8 +253,9 @@ func SetDefaults_SySchedArgs(obj *SySchedArgs) {
 
 const (
 	// Defaults for LatencyAware plugin
-	DefaultProbeAppLabel  = "probe-app"
-	DefaultTargetAppLabel = "target-app"
+	DefaultProbeAppLabel   = "probe-app"
+	DefaultTargetAppLabel  = "target-app"
+	DefaultTaintToleration = false
 )
 
 // SetDefaults_LatencyAwareArgs sets the default parameters for the LatencyAware plugin
@@ -267,5 +268,10 @@ func SetDefaults_LatencyAwareArgs(obj *LatencyAwareArgs) {
 	if obj.TargetAppLabel == nil {
 		temp := DefaultTargetAppLabel
 		obj.TargetAppLabel = &temp
+	}
+
+	if obj.TaintToleration == nil {
+		temp := DefaultTaintToleration
+		obj.TaintToleration = &temp
 	}
 }

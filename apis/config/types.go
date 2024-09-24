@@ -290,4 +290,6 @@ type LatencyAwareArgs struct {
 	ProbeAppLabel string
 	// targetAppLabel is the app label of the target deployment.
 	TargetAppLabel string
+	// taintToleration is flag that enables the toleration of taints.
+	TaintToleration bool
 }

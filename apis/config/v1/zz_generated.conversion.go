@@ -230,6 +230,9 @@ func autoConvert_v1_LatencyAwareArgs_To_config_LatencyAwareArgs(in *LatencyAware
 	if err := metav1.Convert_Pointer_string_To_string(&in.TargetAppLabel, &out.TargetAppLabel, s); err != nil {
 		return err
 	}
+	if err := metav1.Convert_Pointer_bool_To_bool(&in.TaintToleration, &out.TaintToleration, s); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -243,6 +246,9 @@ func autoConvert_config_LatencyAwareArgs_To_v1_LatencyAwareArgs(in *config.Laten
 		return err
 	}
 	if err := metav1.Convert_string_To_Pointer_string(&in.TargetAppLabel, &out.TargetAppLabel, s); err != nil {
+		return err
+	}
+	if err := metav1.Convert_bool_To_Pointer_bool(&in.TaintToleration, &out.TaintToleration, s); err != nil {
 		return err
 	}
 	return nil

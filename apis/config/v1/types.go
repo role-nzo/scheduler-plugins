@@ -288,4 +288,6 @@ type LatencyAwareArgs struct {
 	ProbeAppLabel *string `json:"probeAppLabel,omitempty"`
 	// targetAppLabel is the app label of the target deployment.
 	TargetAppLabel *string `json:"targetAppLabel,omitempty"`
+	// targetAppLabel is the app label of the target deployment.
+	TaintToleration *bool `json:"taintToleration,omitempty"`
 }

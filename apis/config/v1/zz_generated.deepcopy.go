@@ -76,6 +76,11 @@ func (in *LatencyAwareArgs) DeepCopyInto(out *LatencyAwareArgs) {
 		*out = new(string)
 		**out = **in
 	}
+	if in.TaintToleration != nil {
+		in, out := &in.TaintToleration, &out.TaintToleration
+		*out = new(bool)
+		**out = **in
+	}
 	return
 }
 

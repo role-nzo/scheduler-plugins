@@ -10,8 +10,6 @@ profiles:
     filter:
       enabled:
       - name: LatencyAware
-      disabled:
-      - name: "*"
     permit:
       enabled:
       - name: LatencyAware
@@ -30,3 +28,4 @@ profiles:
     args:
       probeAppLabel: "REPLACE_ME_WITH_PROBE_APP_LABEL"
       targetAppLabel: "REPLACE_ME_WITH_TARGET_APP_LABEL"
+      taintToleration: "REPLACE_ME_WITH_TAINT_TOLERATION"

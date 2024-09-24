@@ -53,11 +53,42 @@ var _ framework.PostBindPlugin = &LatencyAware{}
 var _ framework.ReservePlugin = &LatencyAware{}
 var _ framework.PermitPlugin = &LatencyAware{}
 
+func isWorkerNode(node corev1.Node) bool {
+	// Check if the node has a taint that prevents scheduling (NoSchedule or NoExecute)
+	for _, taint := range node.Spec.Taints {
+		if taint.Effect == corev1.TaintEffectNoSchedule || taint.Effect == corev1.TaintEffectNoExecute {
+			return false
+		}
+	}
+
+	// Check if the node has the role of "master" or "control plane"
+	_, isMaster := node.Labels["node-role.kubernetes.io/master"]
+	_, isControlPlane := node.Labels["node-role.kubernetes.io/control-plane"]
+
+	// If it is not a master or control plane node, then it is a worker
+	return !isMaster && !isControlPlane
+}
+
 func (la *LatencyAware) getNodeCount() (int, error) {
 	nodes, err := la.handle.ClientSet().CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return 0, err
 	}
+
+	// If the TaintToleration is active, filter the non worker nodes (they are not schedulable)
+	if TaintToleration {
+		var n = 0
+
+		// Fitlers the non worker nodes
+		for _, node := range nodes.Items {
+			if isWorkerNode(node) {
+				n++
+			}
+		}
+
+		return n, nil
+	}
+
 	return len(nodes.Items), nil
 }
 
@@ -430,6 +461,7 @@ func (la *LatencyAware) startTimeout(ctx context.Context) error {
 
 var ProbeAppLabel string
 var TargetAppLabel string
+var TaintToleration bool
 
 // New initializes a new plugin and returns it.
 func New(ctx context.Context, obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
@@ -438,9 +470,10 @@ func New(ctx context.Context, obj runtime.Object, h framework.Handle) (framework
 		return nil, fmt.Errorf("[LatencyAwareArgs] want args to be of type LatencyAwareArgs, got %T", obj)
 	}
 
-	klog.Infof("[LatencyAwareArgs] args received. ProbeAppLabel: %s, TargetAppLabel: %s", args.ProbeAppLabel, args.TargetAppLabel)
+	klog.Infof("[LatencyAwareArgs] args received. ProbeAppLabel: %s, TargetAppLabel: %s, TaintToleration: %v", args.ProbeAppLabel, args.TargetAppLabel, args.TaintToleration)
 	ProbeAppLabel = args.ProbeAppLabel
 	TargetAppLabel = args.TargetAppLabel
+	TaintToleration = args.TaintToleration
 
 	la := &LatencyAware{
 		handle:        h,
